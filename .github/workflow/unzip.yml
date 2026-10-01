@@ -1,0 +1,110 @@
+name: Unpack and Push with LFS
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (unzip, unrar, zstd, git-lfs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip unrar zstd git-lfs
+          git lfs install
+
+      - name: Extract archives into repository root
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob dotglob
+
+          for archive in *.tar.zst *.tar.gz *.tar.xz *.tar.bz2 *.zip *.rar; do
+            [[ -f "$archive" ]] || continue
+            echo "📦 Found: $archive"
+
+            tmpdir="$(mktemp -d)"
+            trap 'rm -rf -- "$tmpdir"' EXIT
+
+            # Extract into a temporary directory first, so an archive-named wrapper
+            # folder can be removed before its contents are copied to the repo root.
+            case "$archive" in
+              *.zip)
+                unzip -q "$archive" -d "$tmpdir"
+                ;;
+              *.rar)
+                unrar x -o+ "$archive" "$tmpdir/"
+                ;;
+              *.tar.zst)
+                tar --zstd -xf "$archive" -C "$tmpdir"
+                ;;
+              *.tar.gz)
+                tar -xzf "$archive" -C "$tmpdir"
+                ;;
+              *.tar.xz)
+                tar -xJf "$archive" -C "$tmpdir"
+                ;;
+              *.tar.bz2)
+                tar -xjf "$archive" -C "$tmpdir"
+                ;;
+            esac
+
+            case "$archive" in
+              *.tar.zst) archive_stem="${archive%.tar.zst}" ;;
+              *.tar.gz)   archive_stem="${archive%.tar.gz}" ;;
+              *.tar.xz)   archive_stem="${archive%.tar.xz}" ;;
+              *.tar.bz2)  archive_stem="${archive%.tar.bz2}" ;;
+              *.zip)      archive_stem="${archive%.zip}" ;;
+              *.rar)      archive_stem="${archive%.rar}" ;;
+            esac
+
+            source_dir="$tmpdir"
+            entries=("$tmpdir"/*)
+
+            # Strip a single top-level folder only when it is named after the archive.
+            # Any real folders inside the archive remain intact.
+            if (( ${#entries[@]} == 1 )) && [[ -d "${entries[0]}" ]]; then
+              top_dir="${entries[0]##*/}"
+              if [[ "$top_dir" == "$archive_stem" || "$top_dir" == "$archive" ]]; then
+                source_dir="${entries[0]}"
+              fi
+            fi
+
+            # Copy the extracted contents (including hidden files) directly to the repo root.
+            cp -a -- "$source_dir/." "$GITHUB_WORKSPACE/"
+
+            rm -rf -- "$tmpdir"
+            trap - EXIT
+            rm -v -- "$archive"
+          done
+
+      - name: Track large files with Git LFS
+        run: |
+          # Находим все файлы больше 100 МБ и добавляем их в LFS
+          find . -type f -size +100M -print0 | while IFS= read -r -d '' file; do
+            echo "🔍 Large file detected: $file"
+            git lfs track "$file"
+          done
+          # Также можно явно добавить известные большие файлы
+          git lfs track "mpv/mpv.exe" 2>/dev/null || true
+          git lfs track "mpv/libmpv-2.dll" 2>/dev/null || true
+          # Добавляем .gitattributes
+          git add .gitattributes
+
+      - name: Commit and push with LFS
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          # Проверяем, есть ли изменения
+          if git diff --staged --quiet; then
+            echo "✅ No changes to commit"
+          else
+            git commit -m "📦 Auto-extract and add large files via LFS"
+            git push
+          fi
